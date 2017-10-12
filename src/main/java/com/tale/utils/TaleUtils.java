@@ -1,21 +1,22 @@
 package com.tale.utils;
 
-import com.blade.context.WebContextHolder;
-import com.blade.kit.*;
+import com.blade.kit.DateKit;
+import com.blade.kit.Hashids;
+import com.blade.kit.StringKit;
 import com.blade.mvc.http.Request;
 import com.blade.mvc.http.Response;
-import com.blade.mvc.http.wrapper.Session;
+import com.blade.mvc.http.Session;
 import com.sun.syndication.feed.rss.Channel;
 import com.sun.syndication.feed.rss.Content;
 import com.sun.syndication.feed.rss.Item;
 import com.sun.syndication.io.FeedException;
 import com.sun.syndication.io.WireFeedOutput;
 import com.tale.controller.admin.AttachController;
-import com.tale.ext.Commons;
-import com.tale.ext.Theme;
+import com.tale.extension.Commons;
+import com.tale.extension.Theme;
 import com.tale.init.TaleConst;
-import com.tale.model.Contents;
-import com.tale.model.Users;
+import com.tale.model.entity.Contents;
+import com.tale.model.entity.Users;
 import org.commonmark.Extension;
 import org.commonmark.ext.gfm.tables.TablesExtension;
 import org.commonmark.node.Node;
@@ -25,8 +26,8 @@ import org.commonmark.renderer.html.HtmlRenderer;
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.text.Normalizer;
 import java.util.*;
 import java.util.List;
@@ -43,9 +44,10 @@ public class TaleUtils {
     /**
      * 一个月
      */
-    private static final int one_month = 30 * 24 * 60 * 60;
-
-    private static Random r = new Random();
+    private static final int     one_month  = 30 * 24 * 60 * 60;
+    private static final Random  r          = new Random();
+    private static final Hashids hashIds    = new Hashids(TaleConst.AES_SALT);
+    private static final long[]  hashPrefix = {-1, 2, 0, 1, 7, 0, 9};
 
     /**
      * 匹配邮箱正则
@@ -63,7 +65,10 @@ public class TaleUtils {
      */
     public static void setCookie(Response response, Integer uid) {
         try {
-            String val = Tools.enAes(uid.toString(), TaleConst.AES_SALT);
+            hashPrefix[0] = uid;
+            String val = hashIds.encode(hashPrefix);
+            hashPrefix[0] = -1;
+//            String  val   = new String(EncrypKit.encryptAES(uid.toString().getBytes(), TaleConst.AES_SALT.getBytes()));
             boolean isSSL = Commons.site_url().startsWith("https");
             response.cookie("/", TaleConst.USER_IN_COOKIE, val, one_month, isSSL);
         } catch (Exception e) {
@@ -77,7 +82,7 @@ public class TaleUtils {
      * @return
      */
     public static Users getLoginUser() {
-        Session session = WebContextHolder.session();
+        Session session = com.blade.mvc.WebContext.request().session();
         if (null == session) {
             return null;
         }
@@ -105,11 +110,14 @@ public class TaleUtils {
      */
     public static Integer getCookieUid(Request request) {
         if (null != request) {
-            String value = request.cookie(TaleConst.USER_IN_COOKIE);
-            if (StringKit.isNotBlank(value)) {
+            Optional<String> c = request.cookie(TaleConst.USER_IN_COOKIE);
+            if (c.isPresent()) {
                 try {
-                    String uid = Tools.deAes(value, TaleConst.AES_SALT);
-                    return StringKit.isNotBlank(uid) && StringKit.isNumber(uid) ? Integer.valueOf(uid) : null;
+                    String value = c.get();
+                    long[] ids   = hashIds.decode(value);
+                    if (null != ids && ids.length > 0) {
+                        return Long.valueOf(ids[0]).intValue();
+                    }
                 } catch (Exception e) {
                 }
             }
@@ -130,7 +138,7 @@ public class TaleUtils {
         if (arr.length == 1) {
             return "'" + arr[0] + "'";
         }
-        String a = StringKit.join(arr, "','");
+        String a = String.join("','", arr);
         a = a.substring(2) + "'";
         return a;
     }
@@ -147,10 +155,10 @@ public class TaleUtils {
         }
 
         List<Extension> extensions = Arrays.asList(TablesExtension.create());
-        Parser parser = Parser.builder().extensions(extensions).build();
-        Node document = parser.parse(markdown);
-        HtmlRenderer renderer = HtmlRenderer.builder().extensions(extensions).build();
-        String content = renderer.render(document);
+        Parser          parser     = Parser.builder().extensions(extensions).build();
+        Node            document   = parser.parse(markdown);
+        HtmlRenderer    renderer   = HtmlRenderer.builder().extensions(extensions).build();
+        String          content    = renderer.render(document);
         content = Commons.emoji(content);
 
         // 支持网易云音乐输出
@@ -161,6 +169,7 @@ public class TaleUtils {
         if (TaleConst.BCONF.getBoolean("app.support_gist", true) && content.contains("https://gist.github.com/")) {
             content = content.replaceAll("&lt;script src=\"https://gist.github.com/(\\w+)/(\\w+)\\.js\">&lt;/script>", "<script src=\"https://gist.github.com/$1/$2\\.js\"></script>");
         }
+
         return content;
     }
 
@@ -226,6 +235,8 @@ public class TaleUtils {
         return false;
     }
 
+    private static final Pattern pattern = Pattern.compile("[0x1f]*");
+
     /**
      * 获取RSS输出
      *
@@ -235,24 +246,47 @@ public class TaleUtils {
      */
     public static String getRssXml(java.util.List<Contents> articles) throws FeedException {
         Channel channel = new Channel("rss_2.0");
-        channel.setTitle(TaleConst.OPTIONS.get("site_title"));
+        channel.setTitle(TaleConst.OPTIONS.get("site_title", ""));
         channel.setLink(Commons.site_url());
-        channel.setDescription(TaleConst.OPTIONS.get("site_description"));
+        channel.setDescription(TaleConst.OPTIONS.get("site_description", ""));
         channel.setLanguage("zh-CN");
         java.util.List<Item> items = new ArrayList<>();
         articles.forEach(post -> {
             Item item = new Item();
             item.setTitle(post.getTitle());
             Content content = new Content();
-            content.setValue(Theme.article(post.getContent()));
+            String  value   = Theme.article(post.getContent());
+
+            char[] xmlChar = value.toCharArray();
+            for (int i = 0; i < xmlChar.length; ++i) {
+                if (xmlChar[i] > 0xFFFD) {
+                    //直接替换掉0xb
+                    xmlChar[i] = ' ';
+                } else if (xmlChar[i] < 0x20 && xmlChar[i] != 't' & xmlChar[i] != 'n' & xmlChar[i] != 'r') {
+                    //直接替换掉0xb
+                    xmlChar[i] = ' ';
+                }
+            }
+
+            value = new String(xmlChar);
+
+            content.setValue(value);
             item.setContent(content);
             item.setLink(Theme.permalink(post.getCid(), post.getSlug()));
-            item.setPubDate(DateKit.getDateByUnixTime(post.getCreated()));
+            item.setPubDate(DateKit.toDate(post.getCreated()));
             items.add(item);
         });
         channel.setItems(items);
         WireFeedOutput out = new WireFeedOutput();
         return out.outputString(channel);
+//        try {
+//            return out.outputString(channel);
+//        } catch (org.jdom.IllegalDataException e) {
+//            //e.printStackTrace();
+//
+//        } catch (Exception e) {
+//            throw e;
+//        }
     }
 
     /**
@@ -328,30 +362,15 @@ public class TaleUtils {
     }
 
     public static void download(Response response, String filePath) throws Exception {
-
-        response.contentType("application/octet-stream");
-        response.header("Content-Transfer-Encoding", "binary");
-
         File file = new File(filePath);
-        String fname = file.getName();
-        response.header("Content-Disposition", "attachment; filename=" + fname);
-        OutputStream out = response.outputStream();
-        FileInputStream in = new FileInputStream(file);
-        byte[] buffer = new byte[1024];
-        int len;
-        while ((len = in.read(buffer)) > 0) {
-            out.write(buffer, 0, len);
-        }
-        in.close();
-        out.flush();
-        out.close();
+        response.download(file.getName(), file);
     }
 
     /**
      * 获取某个范围内的随机数
      *
-     * @param max   最大值
-     * @param len   取多少个
+     * @param max 最大值
+     * @param len 取多少个
      * @return
      */
     public static int[] random(int max, int len) {
@@ -375,25 +394,26 @@ public class TaleUtils {
 
     /**
      * 将list转为 (1, 2, 4) 这样的sql输出
+     *
      * @param list
      * @param <T>
      * @return
      */
-    public static <T> String listToInSql(java.util.List<T> list){
+    public static <T> String listToInSql(java.util.List<T> list) {
         StringBuffer sbuf = new StringBuffer();
-        list.forEach( item -> sbuf.append(',').append(item.toString()));
+        list.forEach(item -> sbuf.append(',').append(item.toString()));
         sbuf.append(')');
         return '(' + sbuf.substring(1);
     }
 
     public static final String upDir = AttachController.CLASSPATH.substring(0, AttachController.CLASSPATH.length() - 1);
 
-    public static String getFileKey(String name){
-        String prefix = "/upload/" + DateKit.dateFormat(new Date(), "yyyy/MM");
-        String dir = upDir + prefix;
-        if (!FileKit.exist(dir)) {
+    public static String getFileKey(String name) {
+        String prefix = "/upload/" + DateKit.toString(new Date(), "yyyy/MM");
+        String dir    = upDir + prefix;
+        if (!Files.exists(Paths.get(dir))) {
             new File(dir).mkdirs();
         }
-        return prefix + "/" + com.blade.kit.UUID.UU32() + "." + FileKit.getExtension(name);
+        return prefix + "/" + com.blade.kit.UUID.UU32() + "." + StringKit.fileExt(name);
     }
 }
